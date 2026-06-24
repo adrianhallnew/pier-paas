@@ -1,0 +1,28 @@
+# Docs (planning files — not for public repo)
+/docs/
+
+# Environment
+.env.local
+.env.*.local
+
+# Terraform
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+infra/terraform.tfvars
+infra/*.tfplan
+
+# Node
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+.next/
+.turbo/
+
+# Misc
+.venv/
+.DS_Store
+*.log

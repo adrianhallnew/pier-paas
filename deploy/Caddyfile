@@ -1,0 +1,14 @@
+{
+	admin unix//var/run/pier/caddy.sock|0660
+	acme_dns duckdns {$DUCKDNS_TOKEN}
+	# Staging CA — avoids LE rate limits during iteration.
+	# Remove this line once T1.6/T1.7 pass cleanly, then redeploy for production cert.
+	acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+*.{$DUCKDNS_ROOT}, {$DUCKDNS_ROOT} {
+	tls {
+		dns duckdns {$DUCKDNS_TOKEN}
+	}
+	respond "pier online" 200
+}

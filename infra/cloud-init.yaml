@@ -1,0 +1,229 @@
+#cloud-config
+# Ubuntu 24.04 — Pier VM bootstrap
+# Terraform injects: duckdns_token, duckdns_root, ssh_pubkey, repo_url
+
+# ── Users ─────────────────────────────────────────────────────────────────────
+users:
+  - name: pier
+    groups: [docker, sudo]
+    shell: /bin/bash
+    sudo: []
+    ssh_authorized_keys:
+      - ${ssh_pubkey}
+
+# ── Write static config files ─────────────────────────────────────────────────
+write_files:
+  # SSH hardening
+  - path: /etc/ssh/sshd_config.d/pier.conf
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      AllowUsers pier
+    permissions: "0644"
+
+  # fail2ban sshd jail
+  - path: /etc/fail2ban/jail.d/sshd.conf
+    content: |
+      [sshd]
+      enabled  = true
+      maxretry = 5
+      findtime = 600
+      bantime  = 3600
+    permissions: "0644"
+
+  # Docker daemon: log limits + live-restore
+  - path: /etc/docker/daemon.json
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "10m", "max-file": "3" },
+        "live-restore": true
+      }
+    permissions: "0644"
+
+  # DuckDNS credentials (referenced by systemd units)
+  - path: /etc/pier/duckdns.env
+    content: |
+      DUCKDNS_TOKEN=${duckdns_token}
+      DUCKDNS_ROOT=${duckdns_root}
+    permissions: "0600"
+    owner: root:root
+
+  # DuckDNS heartbeat — systemd service
+  - path: /etc/systemd/system/pier-duckdns-heartbeat.service
+    content: |
+      [Unit]
+      Description=Pier DuckDNS IP heartbeat
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      EnvironmentFile=/etc/pier/duckdns.env
+      ExecStart=/bin/bash -c 'curl -fsSo /dev/null "https://www.duckdns.org/update?domains=$${DUCKDNS_ROOT%%.*}&token=$${DUCKDNS_TOKEN}&ip="'
+    permissions: "0644"
+
+  # DuckDNS heartbeat — systemd timer (every 5 min)
+  - path: /etc/systemd/system/pier-duckdns-heartbeat.timer
+    content: |
+      [Unit]
+      Description=Pier DuckDNS IP heartbeat timer
+
+      [Timer]
+      OnBootSec=1min
+      OnUnitActiveSec=5min
+      AccuracySec=30s
+
+      [Install]
+      WantedBy=timers.target
+    permissions: "0644"
+
+  # Cert-expiry check — systemd service (daily)
+  - path: /etc/systemd/system/pier-cert-expiry.service
+    content: |
+      [Unit]
+      Description=Pier TLS cert expiry check
+      After=docker.service
+
+      [Service]
+      Type=oneshot
+      EnvironmentFile=/etc/pier/duckdns.env
+      ExecStart=/bin/bash -c |
+        EXPIRY=$(echo | openssl s_client -connect "$${DUCKDNS_ROOT}:443" -servername "$${DUCKDNS_ROOT}" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+        if [ -n "$${EXPIRY}" ]; then
+          EXPIRY_EPOCH=$(date -d "$${EXPIRY}" +%s)
+          NOW_EPOCH=$(date +%s)
+          DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
+          if [ "$${DAYS_LEFT}" -lt 14 ]; then
+            echo "CERT_EXPIRY_ALERT: $${DUCKDNS_ROOT} expires in $${DAYS_LEFT} days" | systemd-cat -p err -t pier-cert-expiry
+          fi
+        fi
+    permissions: "0644"
+
+  - path: /etc/systemd/system/pier-cert-expiry.timer
+    content: |
+      [Unit]
+      Description=Daily Pier TLS cert expiry check
+
+      [Timer]
+      OnCalendar=daily
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+    permissions: "0644"
+
+# ── Package sources (Docker CE official repo) ─────────────────────────────────
+apt:
+  sources:
+    docker.list:
+      source: "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $RELEASE stable"
+      keyid: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+      keyserver: https://download.docker.com/linux/ubuntu/gpg
+
+# ── Package installation ──────────────────────────────────────────────────────
+packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-compose-plugin
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  - postgresql-client
+  - make
+  - git
+  - jq
+  - curl
+  - chrony
+  - rclone
+  - age
+
+package_update: true
+package_upgrade: true
+
+# ── Boot commands (run as root, in order) ─────────────────────────────────────
+runcmd:
+  # Timezone
+  - timedatectl set-timezone UTC
+
+  # chrony — verify sync within 2 minutes
+  - systemctl enable --now chrony
+  - |
+    for i in $(seq 1 24); do
+      OFFSET=$(chronyc tracking 2>/dev/null | awk '/System time/ {print $4}' | tr -d '-')
+      if awk "BEGIN {exit ($${OFFSET:-99} < 1) ? 0 : 1}" 2>/dev/null; then
+        break
+      fi
+      sleep 5
+    done
+    OFFSET=$(chronyc tracking 2>/dev/null | awk '/System time/ {print $4}' | tr -d '-')
+    awk "BEGIN {if ($${OFFSET:-99} >= 1) {print \"cloud-init: chrony offset > 1s\"; exit 1}}"
+
+  # ufw firewall
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw --force enable
+
+  # fail2ban
+  - systemctl enable --now fail2ban
+
+  # Swap (4 GB)
+  - |
+    if [ ! -f /swapfile ]; then
+      fallocate -l 4G /swapfile
+      chmod 600 /swapfile
+      mkswap /swapfile
+      swapon /swapfile
+      echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+
+  # Block volume: format and mount at /var/lib/docker
+  # Paravirtualized attachment = /dev/sdb on Ubuntu 24.04 OCI
+  - |
+    DOCKER_DEV=/dev/sdb
+    if [ -b "$${DOCKER_DEV}" ]; then
+      if ! blkid "$${DOCKER_DEV}" | grep -q ext4; then
+        mkfs.ext4 -L pier-docker "$${DOCKER_DEV}"
+      fi
+      mkdir -p /var/lib/docker
+      if ! grep -q "$${DOCKER_DEV}" /etc/fstab; then
+        echo "$${DOCKER_DEV} /var/lib/docker ext4 defaults,discard 0 2" >> /etc/fstab
+      fi
+      mount "$${DOCKER_DEV}" /var/lib/docker || true
+    fi
+
+  # Docker — enable after volume is mounted
+  - systemctl enable --now docker
+
+  # SSH hardening reload
+  - systemctl reload sshd
+
+  # Master key — generate once, never overwrite
+  - |
+    if [ ! -f /etc/pier/master.key ]; then
+      mkdir -p /etc/pier
+      openssl rand 32 > /etc/pier/master.key
+      chmod 400 /etc/pier/master.key
+      chown root:root /etc/pier/master.key
+    fi
+
+  # Runtime paths
+  - mkdir -p /var/pier/builds /var/run/pier
+  - chown pier:pier /var/pier/builds /var/run/pier
+
+  # Systemd timers
+  - systemctl daemon-reload
+  - systemctl enable --now pier-duckdns-heartbeat.timer
+  - systemctl enable --now pier-cert-expiry.timer
+
+  # Clone repo and start Caddy
+  - sudo -u pier git clone ${repo_url} /home/pier/pier
+  - cd /home/pier/pier && docker compose -f deploy/docker-compose.yml up -d --build caddy
+
+final_message: |
+  Pier VM bootstrap complete after $UPTIME seconds.
+  Caddy running. Verify: curl -k https://<duckdns_root>

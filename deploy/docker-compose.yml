@@ -1,0 +1,38 @@
+services:
+  caddy:
+    build:
+      context: ../caddy
+    networks:
+      - pier_proxy
+      - pier_admin
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_admin:/var/run/pier
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    environment:
+      DUCKDNS_TOKEN: ${DUCKDNS_TOKEN}
+      DUCKDNS_ROOT: ${DUCKDNS_ROOT}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--unix-socket", "/var/run/pier/caddy.sock", "http://localhost/config/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+networks:
+  pier_proxy:
+    name: pier_proxy
+    driver: bridge
+  pier_admin:
+    name: pier_admin
+    driver: bridge
+    internal: true
+
+volumes:
+  caddy_data:
+  caddy_config:
+  caddy_admin:
