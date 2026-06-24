@@ -3,10 +3,15 @@ set -euo pipefail
 
 # T1.1–T1.10 smoke tests against the live Pier VM.
 # Usage: VM_IP=1.2.3.4 bash scripts/smoke.sh
-#        or just: bash scripts/smoke.sh  (prompts for IP)
+#        or just: bash scripts/smoke.sh  (reads VM_IP from terraform output)
 
 if [ -z "${VM_IP:-}" ]; then
-  read -rp "VM public IP: " VM_IP
+  VM_IP=$(cd infra && terraform output -raw vm_public_ip 2>/dev/null) || true
+fi
+if [ -z "${VM_IP:-}" ]; then
+  echo "Error: VM_IP not set and 'terraform output vm_public_ip' returned nothing." >&2
+  echo "Run 'make apply' first or set VM_IP=<ip> explicitly." >&2
+  exit 1
 fi
 
 SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/pier_ed25519 pier@${VM_IP}"
